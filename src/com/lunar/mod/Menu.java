@@ -32,6 +32,8 @@ public final class Menu {
     private static final int DIM = 0xFF8A94A6;
 
     private static WindowManager windowManager;
+    private static EspView espView;
+    private static Loop loop;
     private static FrameLayout bubble;
     private static LinearLayout panel;
     private static boolean attached;
@@ -73,6 +75,18 @@ public final class Menu {
 
     private static void build(Context context) {
         windowManager = (WindowManager) context.getSystemService(Context.WINDOW_SERVICE);
+
+        espView = new EspView(context);
+        WindowManager.LayoutParams espParams = params(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.MATCH_PARENT, 0, 0);
+        espParams.flags |= WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                | WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE;
+        windowManager.addView(espView, espParams);
+
+        loop = new Loop(espView);
+        loop.start();
+        Config.append("loop de render iniciado");
 
         bubble = new FrameLayout(context);
         GradientDrawable circle = new GradientDrawable();
@@ -117,11 +131,11 @@ public final class Menu {
         scroll.addView(body);
         panel.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1f));
 
-        addSwitch(context, body, "Fast attack", "fastattack");
         addSwitch(context, body, "ESP jogadores", "esp");
-        addSwitch(context, body, "ESP nome", "esp_name");
-        addSwitch(context, body, "ESP distancia", "esp_distance");
-        addSlider(context, body, "Velocidade", "speed", 1.0, 6.0);
+        addSwitch(context, body, "Aimbot", "aim");
+        addSlider(context, body, "FOV mira", "aim_fov", 60.0, 900.0);
+        addSlider(context, body, "Escala ESP", "esp_scale", 0.4, 2.5);
+        addSwitch(context, body, "Gerar log", "log");
 
         final TextView log = new TextView(context);
         log.setTextColor(DIM);

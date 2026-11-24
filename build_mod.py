@@ -129,9 +129,76 @@ def add_multidex(apk_path, dex_path, out_path):
     print("  menu entrou como", target)
 
 
+def sign(path, out_path):
+    run([ZIPALIGN, "-p", "-f", "4", path, out_path + ".aligned"])
+    run([APKSIGNER, "sign", "--ks", KEYSTORE, "--ks-pass", "pass:" + KS_PASS,
+         "--ks-key-alias", KS_ALIAS, "--out", out_path, out_path + ".aligned"])
+    try:
+        os.remove(out_path + ".aligned")
+    except OSError:
+        pass
+
+
+def patch_one(apk_path, out_path):
+    """patch de um apk unico: compila, injeta provider, reassina."""
+    work = out_path + ".work"
+    shutil.rmtree(work, ignore_errors=True)
+    dex = build_dex(out_path + ".dex")
+    run([JAVA, "-jar", APKTOOL, "d", "-s", "-r", "-f", apk_path, "-o", work])
+    patch_manifest(work)
+    repacked = out_path + ".repacked"
+    run([JAVA, "-jar", APKTOOL, "b", work, "-o", repacked])
+    merged = out_path + ".merged"
+    add_multidex(repacked, dex, merged)
+    sign(merged, out_path)
+    for temp in (work, repacked, merged):
+        if os.path.isdir(temp):
+            shutil.rmtree(temp, ignore_errors=True)
+        elif os.path.exists(temp):
+            os.remove(temp)
+
+
+def build_from_apks(apks_path, out_dir):
+    """modo split: patch no base, reassina todos os splits com a mesma chave."""
+    splits_dir = os.path.join(out_dir, "splits")
+    shutil.rmtree(splits_dir, ignore_errors=True)
+    os.makedirs(splits_dir)
+
+    with zipfile.ZipFile(apks_path, "r") as archive:
+        names = [n for n in archive.namelist() if n.lower().endswith(".apk")]
+        print("  splits encontrados:", len(names))
+        for name in names:
+            target = os.path.join(splits_dir, os.path.basename(name))
+            with open(target, "wb") as handle:
+                handle.write(archive.read(name))
+
+    signed_dir = os.path.join(out_dir, "signed")
+    shutil.rmtree(signed_dir, ignore_errors=True)
+    os.makedirs(signed_dir)
+
+    for name in sorted(os.listdir(splits_dir)):
+        source = os.path.join(splits_dir, name)
+        target = os.path.join(signed_dir, name)
+        if name.startswith("base") or "base-master" in name:
+            print("  patch no", name)
+            patch_one(source, target)
+        else:
+            print("  reassinando", name)
+            sign(source, target)
+
+    final = os.path.join(out_dir, "mod.apks")
+    with zipfile.ZipFile(final, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name in sorted(os.listdir(signed_dir)):
+            archive.write(os.path.join(signed_dir, name), name)
+
+    print("\nok: %s (%.1f MB)" % (final, os.path.getsize(final) / (1024 * 1024)))
+    print("instalar: abre o .apks no MT Manager -> Install")
+    return final
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--base", required=True, help="apk original do jogo")
+    parser.add_argument("--base", required=True, help="apk ou .apks original do jogo")
     parser.add_argument("--out", default="build")
     parser.add_argument("--name", default=None, help="nome do apk final")
     args = parser.parse_args()
@@ -142,6 +209,12 @@ def main():
 
     out_dir = os.path.abspath(args.out)
     os.makedirs(out_dir, exist_ok=True)
+
+    if base.lower().endswith(".apks") or base.lower().endswith(".xapk"):
+        print("[split] modo bundle: patch no base, reassina todos os splits")
+        build_from_apks(base, out_dir)
+        return
+
     work = os.path.join(out_dir, "work")
     shutil.rmtree(work, ignore_errors=True)
 

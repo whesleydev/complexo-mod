@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""Injeta o menu Lunar num APK de jogo Android, sem root.
+
+Pipeline:
+  1. javac + d8   -> classes.dex do menu
+  2. apktool d -s -r  -> so o manifest (rapido, nao decodifica 1GB)
+  3. injeta <provider> no AndroidManifest
+  4. apktool b    -> apk repackado com o dex original intacto
+  5. adiciona classesN.dex com o menu (multidex nativo, API 21+)
+  6. zipalign + apksigner
+
+Uso:
+  python3 build_mod.py --base jogo.apk --out build
+  python3 build_mod.py --base jogo.apk --out build --skip-apktool
+
+Iteracao depois do primeiro build: nao precisa repackar.
+Edita /sdcard/Android/data/<pkg>/files/mod.cfg e reinicia o jogo.
+"""
+
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import zipfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)
+TOOLS = os.path.join(ROOT, "apks", "tools")
+JDK = os.path.join(ROOT, "tools", "jdk-17.0.21.1+2")
+JAVA = os.path.join(JDK, "bin", "java")
+JAVAC = os.path.join(JDK, "bin", "javac")
+ANDROID_JAR = os.path.join(TOOLS, "android-34", "android.jar")
+D8_JAR = os.path.join(TOOLS, "android-14", "lib", "d8.jar")
+APKTOOL = os.path.join(TOOLS, "apktool.jar")
+BUILD_TOOLS = os.path.join(TOOLS, "android-14")
+ZIPALIGN = os.path.join(BUILD_TOOLS, "zipalign")
+APKSIGNER = os.path.join(BUILD_TOOLS, "apksigner")
+KEYSTORE = os.path.join(ROOT, "mod", "build", "mod.keystore")
+KS_PASS = "android"
+KS_ALIAS = "mod"
+
+PROVIDER = (
+    '        <provider\n'
+    '            android:name="com.lunar.mod.Boot"\n'
+    '            android:authorities="com.lunar.mod.boot"\n'
+    '            android:exported="false"\n'
+    '            android:initOrder="999" />\n'
+    '    </application>'
+)
+
+
+def run(cmd, **kwargs):
+    printable = " ".join(cmd) if isinstance(cmd, list) else cmd
+    print("  $", printable[:160])
+    result = subprocess.run(cmd, capture_output=True, text=True, **kwargs)
+    if result.returncode != 0:
+        print(result.stdout[-2000:])
+        print(result.stderr[-2000:])
+        raise SystemExit("falhou: " + printable[:120])
+    return result
+
+
+def build_dex(out_dir):
+    classes = os.path.join(out_dir, "classes")
+    dex = os.path.join(out_dir, "dex")
+    shutil.rmtree(classes, ignore_errors=True)
+    shutil.rmtree(dex, ignore_errors=True)
+    os.makedirs(classes)
+    os.makedirs(dex)
+
+    sources = []
+    for root, _, files in os.walk(os.path.join(HERE, "src")):
+        for name in files:
+            if name.endswith(".java"):
+                sources.append(os.path.join(root, name))
+
+    run([JAVAC, "-source", "8", "-target", "8", "-bootclasspath", ANDROID_JAR,
+         "-d", classes] + sources)
+    class_files = []
+    for root, _, files in os.walk(classes):
+        for name in files:
+            if name.endswith(".class"):
+                class_files.append(os.path.join(root, name))
+    run([JAVA, "-cp", D8_JAR, "com.android.tools.r8.D8", "--min-api", "24",
+         "--output", dex] + class_files)
+    return os.path.join(dex, "classes.dex")
+
+
+def patch_manifest(work_dir):
+    manifest = os.path.join(work_dir, "AndroidManifest.xml")
+    with open(manifest, "r", encoding="utf-8") as handle:
+        text = handle.read()
+
+    if "com.lunar.mod.Boot" in text:
+        print("  manifest ja tem o provider")
+        return text
+
+    if "</application>" not in text:
+        raise SystemExit("manifest sem </application>")
+
+    text = text.replace("</application>", PROVIDER, 1)
+    with open(manifest, "w", encoding="utf-8") as handle:
+        handle.write(text)
+
+    package = re.search(r'package="([^"]+)"', text)
+    print("  provider injetado em", package.group(1) if package else "?")
+    return text
+
+
+def add_multidex(apk_path, dex_path, out_path):
+    with zipfile.ZipFile(apk_path, "r") as source:
+        names = source.namelist()
+        indexes = []
+        for name in names:
+            match = re.match(r"classes(\d*)\.dex", name)
+            if match:
+                suffix = match.group(1)
+                indexes.append(int(suffix) if suffix else 1)
+        target = "classes%d.dex" % ((max(indexes) + 1) if indexes else 2)
+
+        with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as dest:
+            for item in source.infolist():
+                if item.filename == target:
+                    continue
+                dest.writestr(item, source.read(item.filename))
+            dest.write(dex_path, target)
+    print("  menu entrou como", target)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--base", required=True, help="apk original do jogo")
+    parser.add_argument("--out", default="build")
+    parser.add_argument("--name", default=None, help="nome do apk final")
+    args = parser.parse_args()
+
+    base = os.path.abspath(args.base)
+    if not os.path.exists(base):
+        raise SystemExit("apk nao encontrado: " + base)
+
+    out_dir = os.path.abspath(args.out)
+    os.makedirs(out_dir, exist_ok=True)
+    work = os.path.join(out_dir, "work")
+    shutil.rmtree(work, ignore_errors=True)
+
+    print("[1/6] compilando menu")
+    dex = build_dex(out_dir)
+
+    print("[2/6] decodificando manifest (sem fontes, sem recursos)")
+    run([JAVA, "-jar", APKTOOL, "d", "-s", "-r", "-f", base, "-o", work])
+
+    print("[3/6] injetando provider")
+    patch_manifest(work)
+
+    print("[4/6] repackando")
+    repacked = os.path.join(out_dir, "repacked.apk")
+    run([JAVA, "-jar", APKTOOL, "b", work, "-o", repacked])
+
+    print("[5/6] adicionando dex do menu")
+    merged = os.path.join(out_dir, "merged.apk")
+    add_multidex(repacked, dex, merged)
+
+    print("[6/6] alinhando e assinando")
+    aligned = os.path.join(out_dir, "aligned.apk")
+    run([ZIPALIGN, "-p", "-f", "4", merged, aligned])
+    final = os.path.join(out_dir, args.name or ("mod-" + os.path.basename(base)))
+    run([APKSIGNER, "sign", "--ks", KEYSTORE, "--ks-pass", "pass:" + KS_PASS,
+         "--ks-key-alias", KS_ALIAS, "--out", final, aligned])
+    run([APKSIGNER, "verify", "--print-certs", final])
+
+    size = os.path.getsize(final) / (1024 * 1024)
+    print("\nok: %s (%.1f MB)" % (final, size))
+    print("instalar: adb install -r %s" % final)
+
+
+if __name__ == "__main__":
+    main()

@@ -125,6 +125,12 @@ def patch_manifest(work_dir):
     if "</application>" not in text:
         raise SystemExit("manifest sem </application>")
 
+    if "SYSTEM_ALERT_WINDOW" not in text:
+        text = text.replace("<application",
+                            '    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />\n'
+                            '    <application', 1)
+        print("  permissao SYSTEM_ALERT_WINDOW injetada")
+
     text = text.replace("</application>", PROVIDER, 1)
     with open(manifest, "w", encoding="utf-8") as handle:
         handle.write(text)

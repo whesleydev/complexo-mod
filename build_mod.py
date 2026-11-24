@@ -31,9 +31,13 @@ TOOLS = os.path.join(ROOT, "apks", "tools")
 JDK = os.path.join(ROOT, "tools", "jdk-17.0.21.1+2")
 JAVA = os.path.join(JDK, "bin", "java")
 JAVAC = os.path.join(JDK, "bin", "javac")
+os.environ["PATH"] = os.path.join(JDK, "bin") + os.pathsep + os.environ.get("PATH", "")
 ANDROID_JAR = os.path.join(TOOLS, "android-34", "android.jar")
 D8_JAR = os.path.join(TOOLS, "android-14", "lib", "d8.jar")
 APKTOOL = os.path.join(TOOLS, "apktool.jar")
+NDK = os.environ.get("LUNAR_NDK", "/tmp/ndk/android-ndk-r26d")
+NATIVE_SRC = os.path.join(HERE, "native", "lunar.cpp")
+NATIVE_OUT = "lib/arm64-v8a/liblunar.so"
 BUILD_TOOLS = os.path.join(TOOLS, "android-14")
 ZIPALIGN = os.path.join(BUILD_TOOLS, "zipalign")
 APKSIGNER = os.path.join(BUILD_TOOLS, "apksigner")
@@ -88,6 +92,27 @@ def build_dex(out_dir):
     return os.path.join(dex, "classes.dex")
 
 
+def build_native(out_dir):
+    """compila liblunar.so em arm64 com o NDK."""
+    compiler = os.path.join(NDK, "toolchains", "llvm", "prebuilt", "linux-x86_64", "bin",
+                            "aarch64-linux-android24-clang++")
+    if not os.path.exists(compiler):
+        print("  NDK ausente, seguindo sem motor nativo")
+        return None
+    target = os.path.join(out_dir, "liblunar.so")
+    env = dict(os.environ)
+    env["PATH"] = os.path.dirname(compiler) + os.pathsep + env.get("PATH", "")
+    print("  $ clang++ -> liblunar.so")
+    result = subprocess.run([compiler, "-std=c++17", "-O2", "-fPIC", "-shared",
+                             "-o", target, NATIVE_SRC, "-llog", "-ldl",
+                             "-Wl,-soname,liblunar.so"],
+                            capture_output=True, text=True, env=env)
+    if result.returncode != 0:
+        print(result.stderr[-1500:])
+        raise SystemExit("falha ao compilar liblunar.so")
+    return target
+
+
 def patch_manifest(work_dir):
     manifest = os.path.join(work_dir, "AndroidManifest.xml")
     with open(manifest, "r", encoding="utf-8") as handle:
@@ -109,7 +134,7 @@ def patch_manifest(work_dir):
     return text
 
 
-def add_multidex(apk_path, dex_path, out_path):
+def add_multidex(apk_path, dex_path, out_path, native_path=None):
     with zipfile.ZipFile(apk_path, "r") as source:
         names = source.namelist()
         indexes = []
@@ -126,7 +151,17 @@ def add_multidex(apk_path, dex_path, out_path):
                     continue
                 dest.writestr(item, source.read(item.filename))
             dest.write(dex_path, target)
+            if native_path and os.path.exists(native_path):
+                info = zipfile.ZipInfo(NATIVE_OUT)
+                info.compress_type = zipfile.ZIP_STORED
+                with open(native_path, "rb") as handle:
+                    dest.writestr(info, handle.read())
+                print("  motor entrou como", NATIVE_OUT)
     print("  menu entrou como", target)
+
+
+def out_dir_of(path):
+    return os.path.dirname(os.path.abspath(path))
 
 
 def sign(path, out_path):
@@ -144,12 +179,13 @@ def patch_one(apk_path, out_path):
     work = out_path + ".work"
     shutil.rmtree(work, ignore_errors=True)
     dex = build_dex(out_path + ".dex")
-    run([JAVA, "-jar", APKTOOL, "d", "-s", "-r", "-f", apk_path, "-o", work])
+    native = build_native(out_dir_of(out_path))
+    run([JAVA, "-jar", APKTOOL, "d", "-s", "-f", apk_path, "-o", work])
     patch_manifest(work)
     repacked = out_path + ".repacked"
     run([JAVA, "-jar", APKTOOL, "b", work, "-o", repacked])
     merged = out_path + ".merged"
-    add_multidex(repacked, dex, merged)
+    add_multidex(repacked, dex, merged, native)
     sign(merged, out_path)
     for temp in (work, repacked, merged):
         if os.path.isdir(temp):
@@ -220,9 +256,10 @@ def main():
 
     print("[1/6] compilando menu")
     dex = build_dex(out_dir)
+    native = build_native(out_dir)
 
-    print("[2/6] decodificando manifest (sem fontes, sem recursos)")
-    run([JAVA, "-jar", APKTOOL, "d", "-s", "-r", "-f", base, "-o", work])
+    print("[2/6] decodificando manifest e recursos (sem fontes)")
+    run([JAVA, "-jar", APKTOOL, "d", "-s", "-f", base, "-o", work])
 
     print("[3/6] injetando provider")
     patch_manifest(work)
@@ -233,7 +270,7 @@ def main():
 
     print("[5/6] adicionando dex do menu")
     merged = os.path.join(out_dir, "merged.apk")
-    add_multidex(repacked, dex, merged)
+    add_multidex(repacked, dex, merged, native)
 
     print("[6/6] alinhando e assinando")
     aligned = os.path.join(out_dir, "aligned.apk")
